@@ -18,6 +18,8 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
 
   config_name "influxdb"
 
+  milestone 1
+
   # The database to write
   config :db, :validate => :string, :default => "stats"
 
@@ -42,6 +44,24 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
   # Events for the same series will be batched together where possible
   # Both keys and values support sprintf formatting
   config :data_points, :validate => :hash, :default => {}, :required => true
+
+  # Support for receiving additional data_points from a hash in the LogStash event. If set,
+  # all values from the event's hash found at this key are added to @data_points.
+  # Event hash key/values override any set in @data_points.
+  config :event_data_points_key, :validate => :string, :default => "", :required => false
+
+  # Determine data_point value types by prefix. You can register several prefixes for each
+  # integer, float, and boolean. Entries in coerce_values will override prefixes.
+  #
+  # For example:
+  #
+  # data_points_type_prefixes => {
+  #     "integer" => ["i_", "int_"]
+  #     "float" => ["f_", "float_"]
+  #     "boolean" => ["b_", "bool_"]
+  # }
+  #
+  config :data_points_type_prefixes, :validate => :hash, :default => {}, :required => false
 
   # Allow the override of the `time` column in the event?
   #
@@ -99,6 +119,15 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
       :max_interval => @idle_flush_time,
       :logger => @logger
     )
+
+    # Validate our types prefixes, if used.
+    if !@data_points_type_prefixes.to_h.empty?
+      ["integer", "float", "boolean"].each do |type|
+        if @data_points_type_prefixes[type].nil?
+          @data_points_type_prefixes[type] = []
+        end
+      end
+    end
   end # def register
   
   public
@@ -123,6 +152,10 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     #     ]
     #   }
     # ]
+    # If we're using a hash from the event, merge that hash into @data_points
+    if @event_data_points_key.length > 0 && event[@event_data_points_key].to_h.length > 0
+      @data_points = @data_points.merge(event[@event_data_points_key].to_h)
+    end
     event_hash = {}
     event_hash['name'] = event.sprintf(@series)
     sprintf_points = Hash[@data_points.map {|k,v| [event.sprintf(k), event.sprintf(v)]}]
@@ -131,6 +164,31 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     else
       sprintf_points['time'] = event.timestamp.to_i
     end
+    # convert types based on prefixes in @data_points_type_prefixes, if available
+    if !@data_points_type_prefixes.to_h.empty?
+      sprintf_points.each do |column, value|
+        next if @coerce_values.has_key?(column)
+        @data_points_type_prefixes["integer"].each do |prefix|
+          if column[0, prefix.length] == prefix
+            @logger.debug("Converting column #{column} to integer due to prefix #{prefix}: Current value: #{value}")
+            sprintf_points[column] = value.to_i
+          end
+        end
+        @data_points_type_prefixes["float"].each do |prefix|
+          if column[0, prefix.length] == prefix
+            @logger.debug("Converting column #{column} to float due to prefix #{prefix}: Current value: #{value}")
+            sprintf_points[column] = value.to_f
+          end
+        end
+        @data_points_type_prefixes["boolean"].each do |prefix|
+          if column[0, prefix.length] == prefix
+            @logger.debug("Converting column #{column} to boolean due to prefix #{prefix}: Current value: #{value}")
+            sprintf_points[column] = value == 'true'
+          end
+        end
+      end
+    end
+    # Override type based on hard-coded coerce_values
     @coerce_values.each do |column, value_type|
       if sprintf_points.has_key?(column)
         begin
@@ -141,6 +199,12 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
           when "float"
             @logger.debug("Converting column #{column} to type #{value_type}: Current value: #{sprintf_points[column]}")
             sprintf_points[column] = sprintf_points[column].to_f
+          when "boolean"
+            @logger.debug("Converting column #{column} to type #{value_type}: Current value: #{sprintf_points[column]}")
+            sprintf_points[column] = sprintf_points[column] == 'true'
+          when "string"
+            @logger.debug("Preserving column #{column} as string: Current value: #{sprintf_points[column]}")
+            # do nothing - already string
           else
             @logger.error("Don't know how to convert to #{value_type}")
           end
