@@ -2,6 +2,7 @@
 require "logstash/namespace"
 require "logstash/outputs/base"
 require "stud/buffer"
+require "json"
 
 # This output lets you output Metrics to InfluxDB
 #
@@ -153,12 +154,13 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     #   }
     # ]
     # If we're using a hash from the event, merge that hash into @data_points
+    data_points = @data_points
     if @event_data_points_key.length > 0 && event[@event_data_points_key].to_h.length > 0
-      @data_points = @data_points.merge(event[@event_data_points_key].to_h)
+      data_points = @data_points.clone().merge(event[@event_data_points_key].to_h)
     end
     event_hash = {}
     event_hash['name'] = event.sprintf(@series)
-    sprintf_points = Hash[@data_points.map {|k,v| [event.sprintf(k), event.sprintf(v)]}]
+    sprintf_points = Hash[data_points.map {|k,v| [event.sprintf(k), event.sprintf(v)]}]
     if sprintf_points.has_key?('time')
       @logger.error("Cannot override value of time without 'allow_override_time'. Using event timestamp") unless @allow_override_time
     else
@@ -219,9 +221,8 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     buffer_receive(event_hash)
   end # def receive
 
-#  def flush; return; end
   def flush(events, teardown=false)
-   # Avoid creating a new string for newline every time
+    # Avoid creating a new string for newline every time
     newline = "\n".freeze
 
     # seen_series stores a list of series and associated columns
