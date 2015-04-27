@@ -21,7 +21,7 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
 
   milestone 1
 
-  # The database to write
+  # The database to write - supports sprintf formatting
   config :db, :validate => :string, :default => "stats"
 
   # The hostname or IP address to reach your InfluxDB instance
@@ -104,6 +104,13 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
   # near-real-time.
   config :idle_flush_time, :validate => :number, :default => 1
 
+  # return the URL for the input db
+  def url_for_db(db)
+    query_params = "u=#{@user}&p=#{@password.value}&time_precision=#{@time_precision}"
+    base_url = "http://#{@host}:#{@port}/db/#{db}/series"
+    url = "#{base_url}?#{query_params}"
+  end
+
   public
   def register
     require "ftw" # gem ftw
@@ -111,10 +118,6 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     @agent = FTW::Agent.new
     @queue = []
 
-    @query_params = "u=#{@user}&p=#{@password.value}&time_precision=#{@time_precision}"
-    @base_url = "http://#{@host}:#{@port}/db/#{@db}/series"
-    @url = "#{@base_url}?#{@query_params}"
-    
     buffer_initialize(
       :max_items => @flush_size,
       :max_interval => @idle_flush_time,
@@ -156,7 +159,7 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     # If we're using a hash from the event, merge that hash into @data_points
     data_points = @data_points
     if @event_data_points_key.length > 0 && event[@event_data_points_key].to_h.length > 0
-      data_points = @data_points.clone().merge(event[@event_data_points_key].to_h)
+      data_points = @data_points.merge(event[@event_data_points_key].to_h)
     end
     event_hash = {}
     event_hash['name'] = event.sprintf(@series)
@@ -215,6 +218,7 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
         end
       end
     end
+    event_hash['db'] = event.sprintf(@db)
     event_hash['columns'] = sprintf_points.keys
     event_hash['points'] = []
     event_hash['points'] << sprintf_points.values
@@ -222,9 +226,6 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
   end # def receive
 
   def flush(events, teardown=false)
-    # Avoid creating a new string for newline every time
-    newline = "\n".freeze
-
     # seen_series stores a list of series and associated columns
     # we've seen for each event
     # so that we can attempt to batch up points for a given series.
@@ -233,8 +234,25 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
     seen_series = {}
     event_collection = []
 
+    # Each database gets its own collection
+    db_collections = {}
+
+    # Events might belong to different databases, which have separate URLs to post to.
+    # Within a database, the events might belong to different series, which are grouped
+    # in the POST body.
     events.each do |ev|
       begin
+        # Get seen_series and event_collection for this target database
+        if db_collections.has_key?(ev['db'])
+          db_collection = db_collections[ev['db']]
+          seen_series = db_collection['seen_series']
+          event_collection = db_collection['event_collection']
+        else
+          seen_series = {}
+          event_collection = []
+          db_collections[ev['db']] = { 'seen_series' => seen_series, 'event_collection' => event_collection }
+        end
+
         if seen_series.has_key?(ev['name']) and (seen_series[ev['name']] == ev['columns'])
           @logger.info("Existing series data found. Appending points to that series")
           event_collection.select {|h| h['points'] << ev['points'][0] if h['name'] == ev['name']}
@@ -251,13 +269,20 @@ class LogStash::Outputs::InfluxDB < LogStash::Outputs::Base
         next
       end
     end
-    post(event_collection.to_json)
+
+    # Post to each database
+    db_collections.each do |db_name, val|
+      url = url_for_db(db_name)
+      event_collection = val['event_collection']
+      post(url, event_collection.to_json)
+    end
+
   end # def receive_bulk
 
-  def post(body)
+  def post(post_url, body)
     begin
       @logger.debug("Post body: #{body}")
-      response = @agent.post!(@url, :body => body)
+      response = @agent.post!(post_url, :body => body)
     rescue EOFError
       @logger.warn("EOF while writing request or reading response header from InfluxDB",
                    :host => @host, :port => @port)

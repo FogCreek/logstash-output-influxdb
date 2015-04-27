@@ -9,9 +9,13 @@ require "logstash/event"
 
 # Fake plugin that overrides post(body), and bypasses some unnecessary setup.
 class FakePlugin < LogStash::Outputs::InfluxDB
-  # Get the body of the last post
-  def body
-    @body
+  # Get the posts - a dictionary of host->POST body
+  def posts
+    return @posts
+  end
+
+  def reset
+    @posts = {}
   end
 
   # Get how many post attempts have we made
@@ -36,17 +40,22 @@ class FakePlugin < LogStash::Outputs::InfluxDB
       :max_interval => 100,
       :logger => nil
     )
+
+    self.reset()
   end
 
   # Overridden plugin function - we capture the last body posted for later inspection, and fail @remaining_fail_count
   # times with exception.
-  def post(body)
+  def post(url, body)
     @attempt_count = attempt_count() + 1
     if !@remaining_fail_count.nil? and @remaining_fail_count > 0
         @remaining_fail_count -= 1
         raise "Planned fail to post(body)"
     end
-    @body = body
+    if @posts.has_key?(url)
+      raise "Error - already posted to this host"
+    end
+    @posts[url] = body
   end
 end
 
@@ -57,6 +66,7 @@ describe LogStash::Outputs::InfluxDB do
     "@timestamp"=> "2015-03-25T04:45:12.000Z",
     "host"=> "localhost",
     "@message"=> "Hello world!",
+    "dbval"=> "host123",
     "influxdb_data_points"=>
     { "user"=> "fprefect",
       "i_account"=> "1000",
@@ -71,6 +81,7 @@ describe LogStash::Outputs::InfluxDB do
     "@version"=> "1",
     "@timestamp"=> "2015-03-26T04:45:12.000Z",
     "host"=> "localhost",
+    "dbval"=> "host123",
     "@message"=> "Hi!",
     "influxdb_data_points"=>
     { "user"=> "adent",
@@ -86,6 +97,7 @@ describe LogStash::Outputs::InfluxDB do
     "@version"=> "1",
     "@timestamp"=> "2015-03-27T04:45:12.000Z",
     "host"=> "localhost",
+    "dbval"=> "host345",
     "@message"=> "Hey Now!",
     "influxdb_data_points"=>
     { "user"=> "zbeeblebrox",
@@ -106,6 +118,7 @@ describe LogStash::Outputs::InfluxDB do
       'data_points' => {
         'message' => '%{@message}'
       },
+      'db' => '%{dbval}',       # In this case, we're dynamically picking the DB to post to from the event
       'series' => 'my_series',
       'event_data_points_key' => 'influxdb_data_points',
       'data_points_type_prefixes' => {
@@ -123,12 +136,15 @@ describe LogStash::Outputs::InfluxDB do
     insist { flush_count } == 3
 
     # We should see both the data_points field and those defined in our hash
-    expected_body = <<END
-[{"name":"my_series","columns":["message","user","i_account","i_foo","f_timing","host","time"],"points":[["Hello world!","fprefect",1000,1,1.23,"host1",1427258712],["Hi!","adent",1001,2,1.43,"host2",1427345112],["Hey Now!","zbeeblebrox",1002,3,1.53,"host3",1427431512]]}]
+    host123_expected_body = <<END
+[{"name":"my_series","columns":["message","user","i_account","i_foo","f_timing","host","time"],"points":[["Hello world!","fprefect",1000,1,1.23,"host1",1427258712],["Hi!","adent",1001,2,1.43,"host2",1427345112]]}]
 END
-    expected_body = expected_body.chop
-    insist {plugin.body} == expected_body
-    insist {plugin.attempt_count} == 1
+    host345_expected_body = <<END
+[{"name":"my_series","columns":["message","user","i_account","i_foo","f_timing","host","time"],"points":[["Hey Now!","zbeeblebrox",1002,3,1.53,"host3",1427431512]]}]
+END
+    insist {plugin.posts['http://localhost:8086/db/host123/series?u=foo&p=hey&time_precision=s']} == host123_expected_body.chop
+    insist {plugin.posts['http://localhost:8086/db/host345/series?u=foo&p=hey&time_precision=s']} == host345_expected_body.chop
+    insist {plugin.attempt_count} == 2
   end
 
   describe 'Retry sends proper batch' do
@@ -140,6 +156,7 @@ END
       'data_points' => {
         'message' => '%{@message}'
       },
+      'db' => 'host12345',    # hard-coded db
       'series' => 'my_series',
       'event_data_points_key' => 'influxdb_data_points',
       'data_points_type_prefixes' => {
@@ -162,7 +179,7 @@ END
 [{"name":"my_series","columns":["message","user","i_account","i_foo","f_timing","host","time"],"points":[["Hello world!","fprefect",1000,1,1.23,"host1",1427258712],["Hi!","adent",1001,2,1.43,"host2",1427345112],["Hey Now!","zbeeblebrox",1002,3,1.53,"host3",1427431512]]}]
 END
     expected_body = expected_body.chop
-    insist {plugin.body} == expected_body
+    insist {plugin.posts['http://localhost:8086/db/host12345/series?u=foo&p=hey&time_precision=s']} == expected_body
     insist {plugin.attempt_count} == 4
   end
 
@@ -174,6 +191,7 @@ END
       'data_points' => {
         'message' => '%{@message}'
       },
+      'db' => 'host12345',    # hard-coded db
       'series' => 'my_series',
       'event_data_points_key' => 'influxdb_data_points',
       'data_points_type_prefixes' => {
@@ -211,6 +229,6 @@ END
 [{"name":"my_series","columns":["message","user","i_account","i_foo","f_timing","host","time"],"points":[["Hello world!","fprefect",1000,1,1.23,"host1",1427258712],["Hi!","adent",1001,2,1.43,"host2",1427345112],["Hey Now!","zbeeblebrox",1002,3,1.53,"host3",1427431512]]},{"name":"my_series","columns":["message","user","i_account","i_foo","host","time"],"points":[["Good morning.","lprocesser",1003,4,"host4",1427431512]]}]
 END
     expected_body = expected_body.chop
-    insist {plugin.body} == expected_body
+    insist {plugin.posts['http://localhost:8086/db/host12345/series?u=foo&p=hey&time_precision=s']} == expected_body
   end
 end
